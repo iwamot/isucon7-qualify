@@ -227,7 +227,7 @@ def fetch_unread():
     if not user_id:
         flask.abort(403)
 
-    time.sleep(1.0)
+#    time.sleep(1.0)
 
     cur = dbh().cursor()
     cur.execute('SELECT id FROM channel')
@@ -236,7 +236,7 @@ def fetch_unread():
 
     res = []
     for channel_id in channel_ids:
-        cur.execute('SELECT message_id FROM haveread WHERE user_id = %s AND channel_id = %s', (user_id, channel_id))
+        cur.execute('SELECT message_id FROM haveread WHERE user_id = %s AND channel_id = %s LIMIT 1', (user_id, channel_id))
         row = cur.fetchone()
         if row:
             cur.execute('SELECT COUNT(*) as cnt FROM message WHERE channel_id = %s AND %s < id',
