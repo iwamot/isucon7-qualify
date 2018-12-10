@@ -27,7 +27,6 @@ config = {
     'db_password': os.environ.get('ISUBATA_DB_PASSWORD', ''),
 }
 
-
 def dbh():
     if hasattr(flask.g, 'db'):
         return flask.g.db
@@ -366,6 +365,8 @@ def post_profile():
                 avatar_data = data
 
     if avatar_name and avatar_data:
+        icon_path = icons_folder / avatar_name
+        icon_path.write_bytes(avatar_data)
         cur.execute("INSERT INTO image (name, data) VALUES (%s, _binary %s)", (avatar_name, avatar_data))
         cur.execute("UPDATE user SET avatar_icon = %s WHERE id = %s", (avatar_name, user_id))
 
@@ -391,11 +392,18 @@ def get_icon(file_name):
     mime = ext2mime(ext)
     if not mime:
         flask.abort(404)
+
+    icon_path = icons_folder / file_name
+    if icon_path.exists():
+        return flask.send_from_directory(str(icons_folder), file_name, mimetype=mime)
+
     cur = dbh().cursor()
     cur.execute("SELECT data FROM image WHERE name = %s", (file_name,))
     row = cur.fetchone()
     if not row:
         flask.abort(404)
+
+    icon_path.write_bytes(row['data'])
     return flask.Response(row['data'], mimetype=mime)
 
 
