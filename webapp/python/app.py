@@ -9,6 +9,7 @@ import random
 import string
 import tempfile
 import time
+import redis
 
 
 static_folder = pathlib.Path(__file__).resolve().parent.parent / 'public'
@@ -45,6 +46,14 @@ def dbh():
     cur.execute("SET SESSION sql_mode='TRADITIONAL,NO_AUTO_VALUE_ON_ZERO,ONLY_FULL_GROUP_BY'")
     return flask.g.db
 
+def rh():
+    if hasattr(flask.g, 'r'):
+        return flask.g.r
+
+    pool = redis.ConnectionPool(host='localhost', port=6379, db=0)
+    flask.g.r = redis.StrictRedis(connection_pool=pool)
+    return flask.g.r
+
 
 @app.teardown_appcontext
 def teardown(error):
@@ -61,6 +70,7 @@ def get_initialize():
     cur.execute("DELETE FROM message WHERE id > 10000")
     cur.execute("DELETE FROM haveread")
     cur.close()
+    rh().flushall()
     return ('', 204)
 
 
@@ -72,6 +82,7 @@ def db_get_user(cur, user_id):
 def db_add_message(cur, channel_id, user_id, content):
     cur.execute("INSERT INTO message (channel_id, user_id, content, created_at) VALUES (%s, %s, %s, NOW())",
                 (channel_id, user_id, content))
+    increment_message_count_cache(channel_id)
 
 
 def login_required(func):
@@ -101,8 +112,7 @@ def register(cur, user, password):
             "INSERT INTO user (name, salt, password, display_name, avatar_icon, created_at)"
             " VALUES (%s, %s, %s, %s, %s, NOW())",
             (user, salt, pass_digest, user, "default.png"))
-        cur.execute("SELECT LAST_INSERT_ID() AS last_insert_id")
-        return cur.fetchone()['last_insert_id']
+        return cur.lastrowid
     except MySQLdb.IntegrityError:
         flask.abort(409)
 
@@ -118,12 +128,14 @@ def get_channel_list_info(focus_channel_id=None):
     cur = dbh().cursor()
     cur.execute("SELECT * FROM channel ORDER BY id")
     channels = cur.fetchall()
-    description = ""
 
-    for c in channels:
-        if c['id'] == focus_channel_id:
-            description = c['description']
-            break
+    if focus_channel_id:
+        for c in channels:
+            if c['id'] == focus_channel_id:
+                description = c['description']
+                break
+    else:
+        description = ""
 
     return channels, description
 
@@ -178,11 +190,13 @@ def get_logout():
 
 @app.route('/message', methods=['POST'])
 def post_message():
-    user_id = flask.session['user_id']
-    user = db_get_user(dbh().cursor(), user_id)
     message = flask.request.form['message']
     channel_id = int(flask.request.form['channel_id'])
-    if not user or not message or not channel_id:
+    if not message or not channel_id:
+        flask.abort(403)
+    user_id = flask.session['user_id']
+    user = db_get_user(dbh().cursor(), user_id)
+    if not user:
         flask.abort(403)
     db_add_message(dbh().cursor(), channel_id, user_id, message)
     return ('', 204)
@@ -200,18 +214,24 @@ def get_message():
     cur.execute("SELECT id, user_id, content, created_at FROM message WHERE id > %s AND channel_id = %s ORDER BY id DESC LIMIT 100",
                 (last_message_id, channel_id))
     rows = cur.fetchall()
+
+    users = {}
     response = []
     for row in rows:
         r = {}
         r['id'] = row['id']
-        cur.execute("SELECT name, display_name, avatar_icon FROM user WHERE id = %s", (row['user_id'],))
-        r['user'] = cur.fetchone()
+        if row['user_id'] in users:
+            r['user'] = users[row['user_id']]
+        else:
+            cur.execute("SELECT name, display_name, avatar_icon FROM user WHERE id = %s", (row['user_id'],))
+            r['user'] = cur.fetchone()
+            users[row['user_id']] = r['user']
         r['date'] = row['created_at'].strftime("%Y/%m/%d %H:%M:%S")
         r['content'] = row['content']
         response.append(r)
     response.reverse()
 
-    max_message_id = max(r['id'] for r in rows) if rows else 0
+    max_message_id = rows[0]['id'] if rows else 0
     cur.execute('INSERT INTO haveread (user_id, channel_id, message_id, updated_at, created_at)'
                 ' VALUES (%s, %s, %s, NOW(), NOW())'
                 ' ON DUPLICATE KEY UPDATE message_id = %s, updated_at = NOW()',
@@ -236,16 +256,39 @@ def fetch_unread():
 
     res = []
     for row in rows:
+        r = {}
+        r['channel_id'] = row['id']
         if row['message_id']:
             cur.execute('SELECT COUNT(*) as cnt FROM message WHERE channel_id = %s AND %s < id',
                         (row['id'], row['message_id']))
+            r['unread'] = int(cur.fetchone()['cnt'])
         else:
-            cur.execute('SELECT COUNT(*) as cnt FROM message WHERE channel_id = %s', (row['id'],))
-        r = {}
-        r['channel_id'] = row['id']
-        r['unread'] = int(cur.fetchone()['cnt'])
+            cnt = get_message_count(row['id'])
+            r['unread'] = cnt
         res.append(r)
     return flask.jsonify(res)
+
+
+def get_message_count_cache_key(channel_id):
+    return 'c_m_{}'.format(channel_id)
+
+
+def get_message_count(channel_id):
+    key = get_message_count_cache_key(channel_id)
+    cnt = rh().get(key)
+    if cnt:
+        return int(cnt)
+
+    cur = dbh().cursor()
+    cur.execute("SELECT COUNT(*) as cnt FROM message WHERE channel_id = %s", (channel_id,))
+    cnt = int(cur.fetchone()['cnt'])
+    rh().set(key, cnt)
+    return cnt
+
+
+def increment_message_count_cache(channel_id):
+    key = get_message_count_cache_key(channel_id)
+    rh().incr(key)
 
 
 @app.route('/history/<int:channel_id>')
@@ -259,9 +302,7 @@ def get_history(channel_id):
     page = int(page)
 
     N = 20
-    cur = dbh().cursor()
-    cur.execute("SELECT COUNT(*) as cnt FROM message WHERE channel_id = %s", (channel_id,))
-    cnt = int(cur.fetchone()['cnt'])
+    cnt = get_message_count(channel_id)
     max_page = math.ceil(cnt / N)
     if not max_page:
         max_page = 1
@@ -269,21 +310,28 @@ def get_history(channel_id):
     if not 1 <= page <= max_page:
         flask.abort(400)
 
+    cur = dbh().cursor()
     cur.execute("SELECT id, user_id, content, created_at FROM message WHERE channel_id = %s ORDER BY id DESC LIMIT %s OFFSET %s",
                 (channel_id, N, (page - 1) * N))
     rows = cur.fetchall()
+
+    users = {}
     messages = []
     for row in rows:
         r = {}
         r['id'] = row['id']
-        cur.execute("SELECT name, display_name, avatar_icon FROM user WHERE id = %s", (row['user_id'],))
-        r['user'] = cur.fetchone()
+        if row['user_id'] in users:
+            r['user'] = users[row['user_id']]
+        else:
+            cur.execute("SELECT name, display_name, avatar_icon FROM user WHERE id = %s", (row['user_id'],))
+            r['user'] = cur.fetchone()
+            users[row['user_id']] = r['user']
         r['date'] = row['created_at'].strftime("%Y/%m/%d %H:%M:%S")
         r['content'] = row['content']
         messages.append(r)
     messages.reverse()
 
-    channels, description = get_channel_list_info(channel_id)
+    channels, _ = get_channel_list_info()
     return flask.render_template('history.html',
                                  channels=channels, channel_id=channel_id,
                                  messages=messages, max_page=max_page, page=page)
@@ -367,9 +415,11 @@ def post_profile():
         icon_path = icons_folder / avatar_name
         icon_path.write_bytes(avatar_data)
         cur.execute("INSERT INTO image (name, data) VALUES (%s, _binary %s)", (avatar_name, avatar_data))
-        cur.execute("UPDATE user SET avatar_icon = %s WHERE id = %s", (avatar_name, user_id))
-
-    if display_name:
+        if display_name:
+            cur.execute("UPDATE user SET avatar_icon = %s, display_name = %s WHERE id = %s", (avatar_name, display_name, user_id))
+        else:
+            cur.execute("UPDATE user SET avatar_icon = %s WHERE id = %s", (avatar_name, user_id))
+    elif display_name:
         cur.execute("UPDATE user SET display_name = %s WHERE id = %s", (display_name, user_id))
 
     return flask.redirect('/', 303)
