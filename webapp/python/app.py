@@ -46,6 +46,7 @@ def dbh():
     cur.execute("SET SESSION sql_mode='TRADITIONAL,NO_AUTO_VALUE_ON_ZERO,ONLY_FULL_GROUP_BY'")
     return flask.g.db
 
+
 def rh():
     if hasattr(flask.g, 'r'):
         return flask.g.r
@@ -124,26 +125,44 @@ def get_index():
     return flask.render_template('index.html')
 
 
-def get_channel_list_info(focus_channel_id=None):
+def get_channel_list_cache_key():
+    return 'c_l'
+
+
+def get_channel_list_info():
+    key = get_channel_list_cache_key()
+    if hasattr(flask.g, key):
+        return getattr(flask.g, key)
+
+    val = rh().get(key)
+    if val:
+        channel_list = flask.json.loads(val)
+        setattr(flask.g, key, channel_list)
+        return channel_list
+
     cur = dbh().cursor()
-    cur.execute("SELECT * FROM channel ORDER BY id")
-    channels = cur.fetchall()
+    cur.execute("SELECT id, name FROM channel ORDER BY id")
+    channel_list = cur.fetchall()
 
-    if focus_channel_id:
-        for c in channels:
-            if c['id'] == focus_channel_id:
-                description = c['description']
-                break
-    else:
-        description = ""
+    rh().set(key, flask.json.dumps(channel_list))
+    setattr(flask.g, key, channel_list)
 
-    return channels, description
+    return channel_list
+
+
+def get_channel_description(channel_id):
+    cur = dbh().cursor()
+    cur.execute("SELECT description FROM channel WHERE id = %s", (channel_id,))
+    row = cur.fetchone()
+    description = row['description']
+    return description
 
 
 @app.route('/channel/<int:channel_id>')
 @login_required
 def get_channel(channel_id):
-    channels, description = get_channel_list_info(channel_id)
+    channels = get_channel_list_info()
+    description = get_channel_description(channel_id)
     return flask.render_template('channel.html',
                                  channels=channels, channel_id=channel_id, description=description)
 
@@ -194,9 +213,8 @@ def post_message():
     channel_id = int(flask.request.form['channel_id'])
     if not message or not channel_id:
         flask.abort(403)
-    user_id = flask.session['user_id']
-    user = db_get_user(dbh().cursor(), user_id)
-    if not user:
+    user_id = flask.session.get('user_id')
+    if not user_id:
         flask.abort(403)
     db_add_message(dbh().cursor(), channel_id, user_id, message)
     return ('', 204)
@@ -211,8 +229,12 @@ def get_message():
     channel_id = int(flask.request.args.get('channel_id'))
     last_message_id = int(flask.request.args.get('last_message_id'))
     cur = dbh().cursor()
-    cur.execute("SELECT id, user_id, content, created_at FROM message WHERE id > %s AND channel_id = %s ORDER BY id DESC LIMIT 100",
-                (last_message_id, channel_id))
+    if last_message_id > 0:
+        cur.execute("SELECT id, user_id, content, created_at FROM message WHERE id > %s AND channel_id = %s ORDER BY id DESC LIMIT 100",
+                    (last_message_id, channel_id))
+    else:
+        cur.execute("SELECT id, user_id, content, created_at FROM message WHERE channel_id = %s ORDER BY id DESC LIMIT 100",
+                    (channel_id,))
     rows = cur.fetchall()
 
     users = {}
@@ -247,7 +269,7 @@ def fetch_unread():
         flask.abort(403)
 
 #    time.sleep(1.0)
-    time.sleep(0.2)
+    time.sleep(0.4)
 
     cur = dbh().cursor()
     cur.execute('SELECT c.id, h.message_id FROM channel c '
@@ -259,7 +281,7 @@ def fetch_unread():
         r = {}
         r['channel_id'] = row['id']
         if row['message_id']:
-            cur.execute('SELECT COUNT(*) as cnt FROM message WHERE channel_id = %s AND %s < id',
+            cur.execute('SELECT COUNT(*) as cnt FROM message WHERE channel_id = %s AND id > %s',
                         (row['id'], row['message_id']))
             r['unread'] = int(cur.fetchone()['cnt'])
         else:
@@ -275,9 +297,11 @@ def get_message_count_cache_key(channel_id):
 
 def get_message_count(channel_id):
     key = get_message_count_cache_key(channel_id)
+
     cnt = rh().get(key)
     if cnt:
-        return int(cnt)
+        cnt = int(cnt)
+        return cnt
 
     cur = dbh().cursor()
     cur.execute("SELECT COUNT(*) as cnt FROM message WHERE channel_id = %s", (channel_id,))
@@ -288,7 +312,7 @@ def get_message_count(channel_id):
 
 def increment_message_count_cache(channel_id):
     key = get_message_count_cache_key(channel_id)
-    rh().incr(key)
+    cnt = rh().incr(key)
 
 
 @app.route('/history/<int:channel_id>')
@@ -331,7 +355,7 @@ def get_history(channel_id):
         messages.append(r)
     messages.reverse()
 
-    channels, _ = get_channel_list_info()
+    channels = get_channel_list_info()
     return flask.render_template('history.html',
                                  channels=channels, channel_id=channel_id,
                                  messages=messages, max_page=max_page, page=page)
@@ -340,7 +364,7 @@ def get_history(channel_id):
 @app.route('/profile/<user_name>')
 @login_required
 def get_profile(user_name):
-    channels, _ = get_channel_list_info()
+    channels = get_channel_list_info()
 
     cur = dbh().cursor()
     cur.execute("SELECT * FROM user WHERE name = %s", (user_name,))
@@ -356,7 +380,7 @@ def get_profile(user_name):
 @app.route('/add_channel')
 @login_required
 def get_add_channel():
-    channels, _ = get_channel_list_info()
+    channels = get_channel_list_info()
     return flask.render_template('add_channel.html', channels=channels)
 
 
@@ -367,10 +391,17 @@ def post_add_channel():
     description = flask.request.form['description']
     if not name or not description:
         flask.abort(400)
+
     cur = dbh().cursor()
     cur.execute("INSERT INTO channel (name, description, updated_at, created_at) VALUES (%s, %s, NOW(), NOW())",
                 (name, description))
     channel_id = cur.lastrowid
+
+    key = get_channel_list_cache_key()
+    rh().delete(key)
+    if hasattr(flask.g, key):
+        delattr(flask.g, key)
+
     return flask.redirect('/channel/' + str(channel_id), 303)
 
 
@@ -379,11 +410,6 @@ def post_add_channel():
 def post_profile():
     user_id = flask.session.get('user_id')
     if not user_id:
-        flask.abort(403)
-
-    cur = dbh().cursor()
-    user = db_get_user(cur, user_id)
-    if not user:
         flask.abort(403)
 
     display_name = flask.request.form.get('display_name')
@@ -411,6 +437,7 @@ def post_profile():
                 avatar_name = digest + ext
                 avatar_data = data
 
+    cur = dbh().cursor()
     if avatar_name and avatar_data:
         icon_path = icons_folder / avatar_name
         icon_path.write_bytes(avatar_data)
